@@ -10,6 +10,8 @@ from shapely.geometry import Point, Polygon
 import joblib
 import pandas as pd
 import os
+from datetime import datetime
+import pytz
 
 behavior_model = joblib.load("models/behavior_model.pkl")
 
@@ -197,6 +199,28 @@ def camera_loop():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         print(f"[🚨] Phát hiện xâm nhập tại ({x}, {y})")
                         model.alert(frame.copy(), alert_type="INTRUSION")
+
+                        # === CHỤP ẢNH NGƯỜI XÂM NHẬP ===
+                        save_dir = "/home/admin/Desktop/YOLO/YOLO"
+                        os.makedirs(save_dir, exist_ok=True)
+
+                        now = datetime.now()
+                        timestamp = now.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+
+                        filename = os.path.join(save_dir, f"alert_INTRUSION_{timestamp}.jpg")
+
+                        # Cắt phần người xâm nhập ra khỏi khung hình
+                        person_crop = frame[y:y+h, x:x+w]
+                        if person_crop.size > 0:
+                            cv2.imwrite(filename, person_crop)
+                            print(f"[🕒] Giờ lưu ảnh: {now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+                            print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
+
+                        person_crop = frame[y:y+h, x:x+w]
+                        if person_crop.size > 0:
+                            cv2.imwrite(filename, person_crop)
+                            print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
+
 
                     distance = point_to_polygon_distance((cx, cy), points)
                     prev = person_last_pos.get(person_id)

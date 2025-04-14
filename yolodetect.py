@@ -61,11 +61,13 @@ class YoloDetect():
         }.get(alert_type, "🚨 CẢNH BÁO")
 
         cv2.putText(img, label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        now = datetime.datetime.utcnow()
+
+        now = datetime.datetime.now()  # Lấy giờ hệ thống (đã đúng GMT+7)
         if (self.last_alert is None) or ((now - self.last_alert).total_seconds() > self.alert_telegram_each):
             self.last_alert = now
             timestamp = now.strftime("%Y%m%d_%H%M%S")
-            alert_path = f"alerts/alert_{alert_type}_{timestamp}.jpg"
+            os.makedirs("intrusions", exist_ok=True)
+            alert_path = f"intrusions/alert_{alert_type}_{timestamp}.jpg"
             cv2.imwrite(alert_path, cv2.resize(img, dsize=None, fx=0.5, fy=0.5))
             try:
                 threading.Thread(target=send_telegram_thread, args=(alert_path,), daemon=True).start()
