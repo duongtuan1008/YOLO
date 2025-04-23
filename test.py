@@ -1,14 +1,29 @@
-import pigpio
+import RPi.GPIO as GPIO
+from mfrc522 import MFRC522
 import time
 
-pi = pigpio.pi()
+# Khởi tạo đối tượng MFRC522
+reader = MFRC522()
 
-servo_pin = 17  # hoặc 18
+try:
+    print("🆔 Đang chờ thẻ RFID...")
+    while True:
+        status, _ = reader.MFRC522_Request(reader.PICC_REQIDL)
+        if status != reader.MI_OK:
+            continue
 
-for angle in range(0, 181, 30):
-    pw = int(500 + (angle / 180.0) * 2000)
-    pi.set_servo_pulsewidth(servo_pin, pw)
-    print(f"Quay {angle}° → {pw}µs")
-    time.sleep(1)
+        status, uid = reader.MFRC522_Anticoll()
+        if status != reader.MI_OK:
+            continue
 
-pi.set_servo_pulsewidth(servo_pin, 0)
+        uid_bytes = uid[:4]
+        print("Thẻ quét:", [f"{b:02X}" for b in uid_bytes])
+
+        # Dừng giao tiếp với thẻ RFID
+        reader.MFRC522_StopCrypto1()  # Dừng giao tiếp với thẻ RFID
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("Quá trình bị dừng.")
+finally:
+    GPIO.cleanup()

@@ -16,13 +16,115 @@ from datetime import datetime
 import pytz
 import queue  # Thêm cái này
 import pigpio
+import mimetypes
+import smtplib
+from email.message import EmailMessage
+import imghdr
 import requests  # Thêm dòng này nếu chưa có
+import hashlib
 import mysql.connector
 from RPLCD.i2c import CharLCD
+import mediapipe as mp
+import math
+import joblib
+from mfrc522 import MFRC522
+reader = MFRC522()  # nếu có tham số này
+rfid_list = []
 # Khởi tạo màn hình LCD
 lcd = CharLCD('PCF8574', 0x27)  # Thay '0x27' bằng địa chỉ I2C của LCD (kiểm tra bằng lệnh i2cdetect)
+# khai bao sender_email Reciever_Email và pass_sender 
+Sender_email = "duongtuan10082003@gmail.com"
+Reciever_Email ="duongtuan1008@gmail.com"
+pass_sender = "vrrw tsqa aljl nbrk"
 
-# Hàm kết nối MySQL
+# Các chế độ mật khẩu
+mode_changePass = "*#01#"
+mode_resetPass = "*#02#"
+mode_hardReset = "*#03#"
+mode_addRFID = "*101#"
+mode_delRFID = "*102#"
+mode_delAllRFID = "*103#"
+
+
+pi = pigpio.pi()
+
+# Khởi tạo ThreadPoolExecutor với tối đa 2 luồng (mỗi servo một luồng)
+servo_queue = queue.Queue()
+GPIO.setwarnings(False)
+# Cấu hình GPIO cho servo và đèn
+servo_pin_1 = 17  # Pin servo 1
+servo_pin_2 = 18  # Pin servo 2
+light_pin = 23  # Pin đèn
+auto_mode = True  # True: tự động theo người, False: điều khiển tay
+current_angle_1 = 90  # Servo trục ngang
+current_angle_2 = 90  # Servo trục dọc
+is_yolo_active = True  # Bắt đầu với việc quét YOLO hoạt động
+
+
+# Định nghĩa chân GPIO cho hàng và cột
+ROW_PINS = [6, 13, 19, 26]  # Các chân cho hàng R1, R2, R3, R4
+COL_PINS = [12, 16, 20, 21]  # Các chân cho cột C1, C2, C3, C4
+
+GPIO.cleanup()
+GPIO.setmode(GPIO.BCM)
+RELAY_PIN = 27
+BUZZER =25
+GPIO.setup(BUZZER,GPIO.OUT)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(servo_pin_1, GPIO.OUT)
+GPIO.setup(servo_pin_2, GPIO.OUT)
+GPIO.setup(light_pin, GPIO.OUT)
+pass_def = "12345"
+mode_changePass = '*#01#'
+mode_resetPass = '*#02#'
+password_input = ''
+key_queue = queue.Queue()
+new_pass1 = [''] * 5
+new_pass2 = [''] * 5
+data_input = []
+# Cập nhật để tránh tranh chấp tài nguyên
+lock = threading.Lock()
+KEYPAD = [
+    ['1', '2', '3', 'A'],
+    ['4', '5', '6', 'B'],
+    ['7', '8', '9', 'C'],
+    ['*', '0', '#', 'D']
+]
+
+
+# Hàm kiểm tra thẻ RFID có hợp lệ không
+def is_rfid_allowed(uid_bytes):
+    # Chuyển UID thành chuỗi hex
+    uid_hex = ''.join([f"{b:02X}" for b in uid_bytes])  # Chuyển mỗi byte thành hex
+    print(f"UID đã quét (hex): {uid_hex}")
+    
+    # Kiểm tra xem UID có tồn tại trong danh sách UID hợp lệ từ cơ sở dữ liệu không
+    allowed_uids = load_rfid_list()  # Lấy danh sách UID từ cơ sở dữ liệu
+    return uid_hex in allowed_uids
+
+# Hàm lấy UID từ cơ sở dữ liệu
+# Hàm lấy UID từ cơ sở dữ liệu
+def load_rfid_list():
+    try:
+        conn = connect_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT uid1, uid2, uid3, uid4 FROM rfid_users")
+        rows = cursor.fetchall()
+        allowed_uids = []
+        for row in rows:
+            # Lưu UID dưới dạng chuỗi hex
+            # Chuyển các phần tử từ chuỗi hex (16) thành số nguyên
+            uid = ''.join([f"{int(row[i], 16):02X}" for i in range(4)])  # Chuyển từ hex (base 16) thành chuỗi hex
+            allowed_uids.append(uid)
+        cursor.close()
+        conn.close()
+        return allowed_uids
+    except Exception as e:
+        print("❌ Lỗi khi lấy UID từ DB:", e)
+        return []
+
+
+# Kết nối cơ sở dữ liệu
 def connect_db():
     try:
         conn = mysql.connector.connect(
@@ -35,6 +137,190 @@ def connect_db():
     except mysql.connector.Error as err:
         print(f"❌ Lỗi kết nối MySQL: {err}")
         return None
+
+# ========== RFID HANDLING ==========
+
+def check_rfid_from_db():
+    try:
+        conn = connect_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, uid1, uid2, uid3, uid4 FROM rfid_users ORDER BY id ASC")
+        rows = cursor.fetchall()
+        print("📦 Danh sách RFID trong DB:")
+        for row in rows:
+            print(f"ID {row[0]}: {row[1]} {row[2]} {row[3]} {row[4]}")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print("❌ Lỗi khi đọc RFID từ DB:", e)
+
+def is_rfid_allowed(uid_bytes):
+    # Chuyển UID thành chuỗi hex
+    uid_hex = ''.join([f"{b:02X}" for b in uid_bytes])
+    
+    # Kiểm tra xem UID có tồn tại trong danh sách UID hợp lệ từ cơ sở dữ liệu không
+    allowed_uids = load_rfid_list()  # Lấy danh sách UID từ cơ sở dữ liệu
+    return uid_hex in allowed_uids
+
+def check_rfid_once():
+    global is_yolo_active
+
+    while True:
+        with lock:
+            # Kiểm tra xem có thẻ RFID nào gần đầu đọc không
+            status, _ = reader.MFRC522_Request(reader.PICC_REQIDL)
+            if status != reader.MI_OK:
+                continue  # Không có thẻ, tiếp tục quét
+
+            # Lấy UID của thẻ RFID
+            status, uid = reader.MFRC522_Anticoll()
+            if status != reader.MI_OK:
+                continue  # Không thể lấy UID thẻ, tiếp tục quét
+
+            # Chuyển UID thành dạng hex để dễ kiểm tra
+            uid_bytes = uid[:4]
+            uid_hex = [f"{b:02X}" for b in uid_bytes]
+            print("Thẻ quét:", uid_hex)
+
+            # Hiển thị thông tin lên LCD
+            lcd.clear()
+
+            # Kiểm tra xem thẻ có hợp lệ không
+            if is_rfid_allowed(uid_bytes):
+                lcd.write_string("ACCESS GRANTED")
+                GPIO.output(RELAY_PIN, GPIO.HIGH)  # Mở cửa
+                log_access("RFID User", "RFID", "Mở cửa bằng thẻ")  # Ghi log
+                time.sleep(5)  # Giữ cửa mở trong 5 giây
+                GPIO.output(RELAY_PIN, GPIO.LOW)  # Đóng cửa
+
+                # Tạm thời tắt YOLO để tránh quét đối tượng trong lúc mở cửa
+                is_yolo_active = False
+                time.sleep(5)  # Chờ 5 giây trước khi bật lại YOLO
+                is_yolo_active = True  # Kích hoạt lại YOLO
+            else:
+                lcd.write_string("INVALID RFID")
+                open_buzzer(1)  # Bật chuông cảnh báo
+                SendEmail(Sender_email, pass_sender, Reciever_Email)  # Gửi email cảnh báo
+
+            # Dừng giao tiếp với thẻ RFID sau khi quét xong
+            reader.MFRC522_StopCrypto1()  # Dừng giao tiếp với thẻ RFID
+            reset_lcd_to_default()  # Reset LCD
+
+        # Thời gian chờ trước khi quét lại (điều chỉnh nếu cần)
+        time.sleep(1)
+  # Thời gian giữa các lần quét (có thể điều chỉnh)
+
+# Hàm ghi log khi mở cửa bằng RFID
+def log_access(user_name, access_method, event_description):
+    # Logic ghi log vào cơ sở dữ liệu hoặc file
+    print(f"Logged: {user_name} - {access_method} - {event_description}")
+
+# Hàm chạy trong một luồng riêng
+def run_rfid_thread():
+    while True:
+        check_rfid_once()
+def wait_for_rfid(timeout=10):
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        status, _ = reader.MFRC522_Request(reader.PICC_REQIDL)
+        if status != reader.MI_OK:
+            continue
+
+        status, uid = reader.MFRC522_Anticoll()
+        if status == reader.MI_OK:
+            reader.MFRC522_StopCrypto1()  # Dòng s?a ? dây
+            return [f"{b:02X}" for b in uid[:4]]
+        time.sleep(0.3)
+    return None
+def read_keypad():
+    for row in range(4):  # Loop through all rows
+        GPIO.output(ROW_PINS[row], GPIO.HIGH)  # Activate the current row
+        for col in range(4):  # Loop through all columns
+            if GPIO.input(COL_PINS[col]) == GPIO.HIGH:  # Check if the key is pressed
+                key = KEYPAD[row][col]
+                GPIO.output(ROW_PINS[row], GPIO.LOW)  # Deactivate the row after key is detected
+                return key  # Return the corresponding key
+        GPIO.output(ROW_PINS[row], GPIO.LOW)  # Deactivate the row if no key is detected
+    return None  # Return None if no key is pressed
+def add_new_rfid():
+    global id_rf
+    lcd.clear()
+    lcd.write_string("Nhap ID (1-99)")
+
+    # Nhập ID từ bàn phím keypad
+    id_rf = ''
+    while len(id_rf) < 2:  # Giới hạn nhập ID chỉ gồm 2 chữ số
+        key = read_keypad()
+        if key:
+            print(f"Key pressed: {key}")
+            if key.isdigit():
+                id_rf += key
+                lcd.clear()
+                lcd.write_string(f"ID: {id_rf}")
+            elif key == '#':  # Nếu nhấn '#', xác nhận ID
+                if id_rf.isdigit() and 0 < int(id_rf) <= 99:
+                    break
+                else:
+                    lcd.clear()
+                    lcd.write_string("ID ERROR")
+                    time.sleep(2)
+                    lcd.clear()
+                    lcd.write_string("Nhap lai ID")
+                    id_rf = ''
+                    time.sleep(1)
+            time.sleep(0.3)
+
+    print(f"ID nhập: {id_rf}")
+    lcd.clear()
+    lcd.write_string("Quet the lan 1")
+    print("🕐 Đưa thẻ lần 1...")
+    first_uid = wait_for_rfid()
+    if first_uid is None:
+        lcd.clear()
+        lcd.write_string("KHONG THE")
+        time.sleep(2)
+        return
+
+    print("✅ UID 1:", first_uid)
+
+    # --- Quét lần 2 ---
+    lcd.clear()
+    lcd.write_string("Quet the lan 2")
+    print("🕐 Đưa thẻ lại lần 2...")
+    second_uid = wait_for_rfid()
+    if second_uid is None:
+        lcd.clear()
+        lcd.write_string("KHONG THE")
+        time.sleep(2)
+        return
+
+    print("🔁 UID 2:", second_uid)
+
+    if first_uid != second_uid:
+        lcd.clear()
+        lcd.write_string("KHONG TRUNG")
+        print("⚠️ UID không trùng nhau!")
+        time.sleep(2)
+        return
+
+    # Gửi lên server
+    try:
+        url = f"http://192.168.137.128/api/rfid.php?action=add"
+        url += f"&id={id_rf}&uid1={first_uid[0]}&uid2={first_uid[1]}"
+        url += f"&uid3={first_uid[2]}&uid4={first_uid[3]}"
+        print("📡 Gửi:", url)
+        r = requests.get(url)
+        print("📨 Server:", r.text)
+        lcd.clear()
+        lcd.write_string("THEM OK")
+        load_rfid_list()
+    except:
+        lcd.clear()
+        lcd.write_string("LOI MANG")
+
+    time.sleep(2)
+    reset_lcd_to_default()
+#------------keypad--------------------
 
 def get_device_state():
     try:
@@ -53,41 +339,6 @@ def read_auto_mode():
         return True
 
 
-pi = pigpio.pi()
-
-# Khởi tạo ThreadPoolExecutor với tối đa 2 luồng (mỗi servo một luồng)
-servo_queue = queue.Queue()
-GPIO.setwarnings(False)
-# Cấu hình GPIO cho servo và đèn
-servo_pin_1 = 17  # Pin servo 1
-servo_pin_2 = 18  # Pin servo 2
-light_pin = 23  # Pin đèn
-auto_mode = True  # True: tự động theo người, False: điều khiển tay
-current_angle_1 = 90  # Servo trục ngang
-current_angle_2 = 90  # Servo trục dọc
-# Định nghĩa chân GPIO cho hàng và cột
-ROW_PINS = [6, 13, 19, 26]  # Các chân cho hàng R1, R2, R3, R4
-COL_PINS = [12, 16, 20, 21]  # Các chân cho cột C1, C2, C3, C4
-
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(servo_pin_1, GPIO.OUT)
-GPIO.setup(servo_pin_2, GPIO.OUT)
-GPIO.setup(light_pin, GPIO.OUT)
-pass_def = "12345"
-mode_changePass = '*#01#'
-mode_resetPass = '*#02#'
-password_input = ''
-key_queue = queue.Queue()
-new_pass1 = [''] * 5
-new_pass2 = [''] * 5
-data_input = []
-
-KEYPAD = [
-    ['1', '2', '3', 'A'],
-    ['4', '5', '6', 'B'],
-    ['7', '8', '9', 'C'],
-    ['*', '0', '#', 'D']
-]
 def log_access(user_name, access_method, event_description):
     conn = connect_db()
     if conn is None:
@@ -106,7 +357,10 @@ def log_access(user_name, access_method, event_description):
     finally:
         cursor.close()
         conn.close()
-
+def open_buzzer(thời_gian=1):
+    GPIO.output(BUZZER, GPIO.HIGH)  # Bật buzzer
+    time.sleep(thời_gian)           # Giữ buzzer trong khoảng thời gian nhất định
+    GPIO.output(BUZZER, GPIO.LOW)    # Tắt buzzer
 
 # Thiết lập các chân hàng là output
 for row in ROW_PINS:
@@ -117,23 +371,70 @@ for col in COL_PINS:
     GPIO.setup(col, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 #xử lý password
 #------------------- xử lý dữ liệu nhập từ matrix phím ---------------------
-def get_password():
+# Cập nhật mật khẩu mới vào cơ sở dữ liệu
+def get_password(user_name):
     try:
-        with open('password.txt', 'r') as file:
-            password = file.read().strip()  # Đọc và loại bỏ khoảng trắng/thẻ xuống dòng
-            return password
-    except FileNotFoundError:
-        print("File password.txt không tồn tại.")
+        conn = connect_db()
+        if conn is None:
+            return None
+
+        cursor = conn.cursor()
+        cursor.execute("SELECT password FROM system_settings WHERE id = 1")  # Lấy mật khẩu gốc trực tiếp
+        result = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if result:
+            password = result[0]  # Lấy mật khẩu gốc từ cơ sở dữ liệu
+            print(f"✅ Đã lấy mật khẩu từ DB:\nPassword: {password}")
+            return password  # Trả về mật khẩu
+        else:
+            print("❌ Không tìm thấy người dùng!")
+            return None
+    except mysql.connector.Error as err:
+        print(f"❌ Lỗi khi lấy mật khẩu từ DB: {err}")
         return None
 
-# Gọi hàm lấy mật khẩu
-password = get_password()
 
-if password:
-    # Xử lý mật khẩu (ví dụ: đăng nhập, kết nối API, ...)
-    print(f'Mật khẩu là: {password}')
-else:
-    print("Không thể lấy mật khẩu")
+def update_password(user_name, new_password):
+    try:
+        conn = connect_db()
+        if conn is None:
+            return {"status": "error", "message": "Không thể kết nối đến cơ sở dữ liệu"}
+
+        cursor = conn.cursor()
+        # Cập nhật mật khẩu trực tiếp vào bảng `system_settings`
+        cursor.execute("UPDATE system_settings SET password = %s, updated_at = NOW() WHERE id = 1", (new_password,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return {"status": "success", "message": "Mật khẩu đã được cập nhật"}
+
+    except mysql.connector.Error as err:
+        print(f"❌ Lỗi khi cập nhật mật khẩu: {err}")
+        return {"status": "error", "message": "Lỗi khi cập nhật mật khẩu"}
+
+
+
+def SendEmail(sender, pass_sender, receiver):
+    # Tạo email mới
+    newMessage = EmailMessage()
+    newMessage['Subject'] = "CANH BAO !!!"
+    newMessage['From'] = sender
+    newMessage['To'] = receiver
+    newMessage.set_content('CANH BAO AN NINH')  # Nội dung email chỉ là cảnh báo
+
+    # Gửi email
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
+            smtp.starttls()  # Bắt đầu mã hóa TLS
+            smtp.login(sender, pass_sender)  # Đăng nhập vào email
+            smtp.send_message(newMessage)  # Gửi email
+            print(f"✅ Đã gửi email tới {receiver} với cảnh báo.")
+    except Exception as e:
+        print(f"❌ Lỗi khi gửi email: {e}")
 #get dữ liệu từ bàn phím 
 # Hàm kiểm tra dữ liệu đầu vào
 def isBufferdata(data=[]):
@@ -199,55 +500,77 @@ def read_line(row):
     GPIO.output(row, GPIO.LOW)  # Tắt hàng hiện tại
 
 # Hàm kiểm tra mật khẩu
+
 def check_pass():
-    global password_input, is_checking_password, Sender_email, pass_sender, Reciever_Email
-    clear_lcd()  # Xóa màn hình LCD trước khi hiển thị thông báo
-    lcd.write_string('Checking pass:')  # Hiển thị thông báo đang kiểm tra trên LCD
+    global password_input, is_checking_password, Sender_email, pass_sender, Reciever_Email, is_yolo_active
+
+    clear_lcd()
+    lcd.write_string("Checking pass:")
 
     while True:
-        if len(data_input) < 5:  # Giả sử mật khẩu có 5 ký tự
+        if len(data_input) < 5:
             for row in ROW_PINS:
-                read_line(row)  # Gọi hàm để đọc ký tự từ bàn phím ma trận
-            time.sleep(0.1)  # Tạm dừng một chút để tránh việc lặp quá nhanh
+                read_line(row)
+            time.sleep(0.1)
         else:
-            is_checking_password = True  # Đặt cờ là True để cho biết đang kiểm tra mật khẩu
+            is_checking_password = True
             password_input = ''.join(data_input)
 
-            if password_input == password:
-                lcd.clear()
-                lcd.write_string('---OPENDOOR---')
-                time.sleep(1)  # Đợi 1 giây để hiển thị thông báo "Mật khẩu đúng!"
-                print('Mật khẩu đúng!')
-                log_access("User", "Password", "Mở cửa bằng mật khẩu")
+            stored_password = get_password("user_name")
+            if stored_password:
+                print(f"✅ Nhập: {password_input}")
+                print(f"✅ DB: {stored_password}")
 
+                # Kiểm tra mật khẩu
+                if password_input == stored_password:
+                    lcd.clear()
+                    lcd.write_string("ACCESS GRANTED")
+                    GPIO.output(RELAY_PIN, GPIO.HIGH)
+                    log_access("User", "Password", "Mở cửa bằng mật khẩu")
+                    time.sleep(5)
+                    GPIO.output(RELAY_PIN, GPIO.LOW)
 
-                # Mở relay để mở cửa
-                GPIO.output(RELAY_PIN, GPIO.HIGH)  # Kích hoạt relay (mở cửa)
-                time.sleep(5)  # Giữ cửa mở trong 5 giây
-                GPIO.output(RELAY_PIN, GPIO.LOW)  # Đóng cửa
+                    is_yolo_active = False
+                    time.sleep(10)
+                    is_yolo_active = True
 
-                # Sau khi đóng cửa, đặt lại LCD về trạng thái mặc định
-                reset_lcd_to_default()  # Gọi hàm đưa LCD về trạng thái mặc định
-            elif password_input == mode_changePass:
-                changePass()
-            elif password_input == mode_resetPass:
-                resetPass()
+                # Chế độ thay đổi mật khẩu
+                elif password_input == mode_changePass:
+                    changePass()
+
+                # Chế độ reset mật khẩu
+                elif password_input == mode_resetPass:
+                    resetPass()
+
+                # Chế độ thêm thẻ RFID
+                elif password_input == mode_addRFID:
+                    add_new_rfid()
+
+                # Chế độ xóa thẻ RFID
+                # elif password_input == mode_delRFID:
+                #     del_rfid()
+
+                # # Chế độ xóa tất cả thẻ RFID
+                # elif password_input == mode_delAllRFID:
+                #     del_all_rfid()
+
+                else:
+                    lcd.clear()
+                    lcd.write_string("WRONG PASSWORD")
+                    open_buzzer(1)
+                    print("❌ Sai mật khẩu!")
+                    SendEmail(Sender_email, pass_sender, Reciever_Email)
+
             else:
-                lcd.clear()
-                lcd.write_string('WRONG PASSWORD')  # Hiển thị thông báo lỗi
-                open_buzzer(1)  # Buzzer bật 1 giây khi nhập sai mật khẩu
-                print('Mật khẩu không đúng!')
-                GPIO.output(RELAY_PIN, GPIO.LOW)  # Đảm bảo cửa vẫn đóng
-                # Gửi email với ảnh đã chụp
-                SendEmail(Sender_email, pass_sender, Reciever_Email)
+                print("⚠ Không lấy được mật khẩu từ DB.")
 
-            is_checking_password = False  # Đặt cờ là False sau khi kiểm tra xong
-            clear_data_input()  # Xóa dữ liệu nhập sau khi kiểm tra
-            time.sleep(2)  # Đợi 2 giây trước khi xóa màn hình
-            reset_lcd_to_default()  # Đặt lại trạng thái màn hình về mặc định
-  # Xóa màn hình sau khi hoàn thành kiểm tra
-  # Xóa màn hình sau khi hoàn thành kiểm tra
-  # Xóa màn hình sau khi kiểm tra
+            is_checking_password = False
+            clear_data_input()
+            time.sleep(2)
+            reset_lcd_to_default()
+  # Đặt lại trạng thái màn hình về mặc định  # Đặt lại trạng thái màn hình về mặc định
+  # Đặt lại trạng thái màn hình về mặc định
+
 
 def changePass():
     global password, new_pass1, new_pass2
@@ -306,6 +629,9 @@ def changePass():
         writeEpprom(new_pass2)
         password = ''.join(new_pass2)
 
+        # Ghi mật khẩu mới vào cơ sở dữ liệu
+        update_password("user_name", password)
+
         # Ghi mật khẩu mới vào file password.txt
         try:
             with open('password.txt', 'w') as file:
@@ -320,6 +646,7 @@ def changePass():
         lcd.clear()  # Xóa màn hình trước khi thông báo thành công
         lcd.write_string("Đổi MK thành công")
         time.sleep(2)
+
 def resetPass():
     global password
     clear_lcd()  # Xóa LCD trước khi hiển thị nội dung mới
@@ -399,35 +726,9 @@ def resetPass():
                 clear_data_input()  # Xóa dữ liệu nhập khi sai mật khẩu
                 time.sleep(2)  # Hiển thị thông báo trong 2 giây
                 clear_lcd()  # Xóa màn hình sau khi thông báo sai mật khẩu
-                break  # Kết thúc nếu mật khẩu nhập sai
-#--------------------------------------------------------------
-try:
-    radar = serial.Serial('/dev/ttyAMA3', baudrate=256000, timeout=1)  # UART Radar HLK-LD2410B
-    print("✅ Kết nối cảm biến Radar HLK-LD2410B thành công!")
-except Exception as e:
-    print(f"❌ Lỗi kết nối cảm biến Radar: {e}")
-    exit(1)
-def log_motion_detected():
-    conn = connect_db()
-    if conn is None:
-        print("⚠ Không thể kết nối MySQL, bỏ qua ghi nhật ký chuyển động.")
-        return
-    
-    try:
-        cursor = conn.cursor()
-        detect_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sql = "INSERT INTO motion_log (detect_time, description) VALUES (%s, %s)"
-        values = (detect_time, "Phát hiện chuyển động!")
-        cursor.execute(sql, values)
-        conn.commit()
-        print(f"✅ Ghi nhật ký vào `motion_log`: {detect_time}")
-    except mysql.connector.Error as err:
-        print(f"❌ Lỗi MySQL khi ghi nhật ký vào `motion_log`: {err}")
-    finally:
-        cursor.close()
-        conn.close()
+                break  # Kết thúc nếu mật khẩu nhập sai  # Kết thúc nếu mật khẩu nhập sai
 
-
+#-----------------------------------------------------------
 
 # Hàm điều khiển servo
 
@@ -730,11 +1031,8 @@ def servo_tracking_loop():
 
 # === Luồng xử lý camera và hiển thị ===
 def camera_loop():
-    global latest_frame, detect
+    global latest_frame, detect,is_yolo_active
 
-    import mediapipe as mp
-    import math
-    import joblib
     mp_pose = mp.solutions.pose
     pose_detector = mp_pose.Pose(static_image_mode=False, model_complexity=0, enable_segmentation=False)
 
@@ -761,166 +1059,167 @@ def camera_loop():
             frame = draw_polygon(frame, points)
 
             if detect and len(points) > 2 and frame_count % 2 == 0:
-                small_frame = cv2.resize(frame, (416, 416))
-                height, width = small_frame.shape[:2]
+                if is_yolo_active:
+                    small_frame = cv2.resize(frame, (416, 416))
+                    height, width = small_frame.shape[:2]
 
-                blob = cv2.dnn.blobFromImage(small_frame, 1/255.0, (416, 416), swapRB=True, crop=False)
-                model.model.setInput(blob)
+                    blob = cv2.dnn.blobFromImage(small_frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+                    model.model.setInput(blob)
 
-                layer_names = model.model.getLayerNames()
-                output_layers = [layer_names[i - 1] for i in model.model.getUnconnectedOutLayers()]
-                outputs = model.model.forward(output_layers)
+                    layer_names = model.model.getLayerNames()
+                    output_layers = [layer_names[i - 1] for i in model.model.getUnconnectedOutLayers()]
+                    outputs = model.model.forward(output_layers)
 
-                detections = []
-                for output in outputs:
-                    for detection in output:
-                        scores = detection[5:]
-                        class_id = int(np.argmax(scores))
-                        confidence = scores[class_id]
-                        if class_id == 0 and confidence > 0.5:
-                            center_x = int(detection[0] * width)
-                            center_y = int(detection[1] * height)
-                            w = int(detection[2] * width)
-                            h = int(detection[3] * height)
-                            x = int(center_x - w / 2)
-                            y = int(center_y - h / 2)
-                            detections.append({
-                                "label": "person",
-                                "box": [x, y, w, h],
-                                "center": (center_x, center_y)
-                            })
+                    detections = []
+                    for output in outputs:
+                        for detection in output:
+                            scores = detection[5:]
+                            class_id = int(np.argmax(scores))
+                            confidence = scores[class_id]
+                            if class_id == 0 and confidence > 0.5:
+                                center_x = int(detection[0] * width)
+                                center_y = int(detection[1] * height)
+                                w = int(detection[2] * width)
+                                h = int(detection[3] * height)
+                                x = int(center_x - w / 2)
+                                y = int(center_y - h / 2)
+                                detections.append({
+                                    "label": "person",
+                                    "box": [x, y, w, h],
+                                    "center": (center_x, center_y)
+                                })
 
-                h_ratio = frame.shape[0] / 416
-                w_ratio = frame.shape[1] / 416
+                    h_ratio = frame.shape[0] / 416
+                    w_ratio = frame.shape[1] / 416
 
-                for obj in detections:
-                    x, y, w, h = obj['box']
-                    x = int(x * w_ratio)
-                    y = int(y * h_ratio)
-                    w = int(w * w_ratio)
-                    h = int(h * h_ratio)
-                    cx, cy = x + w // 2, y + h // 2
-                    with person_position_lock:
-                        person_position = (cx, cy, frame.shape[1], frame.shape[0])
-                    person_id = hash(f"{x//10}-{y//10}")
-                    tracker.update(person_id, (x, y, w, h))
+                    for obj in detections:
+                        x, y, w, h = obj['box']
+                        x = int(x * w_ratio)
+                        y = int(y * h_ratio)
+                        w = int(w * w_ratio)
+                        h = int(h * h_ratio)
+                        cx, cy = x + w // 2, y + h // 2
+                        with person_position_lock:
+                            person_position = (cx, cy, frame.shape[1], frame.shape[0])
+                        person_id = hash(f"{x//10}-{y//10}")
+                        tracker.update(person_id, (x, y, w, h))
 
-                    # Kiểm tra xem người có vào vùng cấm không
-                    if point_in_polygon((cx, cy), points):  # Kiểm tra nếu người vào vùng cấm
-                        follow_person_and_alert(cx, cy, frame.shape[1], frame.shape[0], frame)
-                        cv2.putText(frame, "🚨 XÂM NHẬP!", (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        print(f"[🚨] Phát hiện xâm nhập tại ({x}, {y})")
-                        model.alert(frame.copy(), alert_type="INTRUSION")
-
-                        # === CHỤP ẢNH NGƯỜI XÂM NHẬP ===
-                        save_dir = "/var/www/html/uploads"
-                        os.makedirs(save_dir, exist_ok=True)
-
-                        now = datetime.now()
-                        timestamp = now.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-
-                        filename = os.path.join(save_dir, f"alert_INTRUSION_{timestamp}.jpg")
-
-                        # Cắt phần người xâm nhập ra khỏi khung hình
-                        person_crop = frame[y:y+h, x:x+w]
-                        if person_crop.size > 0:
-                            cv2.imwrite(filename, person_crop)
-                            print(f"[🕒] Giờ lưu ảnh: {now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-                            print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
-
-                        person_crop = frame[y:y+h, x:x+w]
-                        if person_crop.size > 0:
-                            cv2.imwrite(filename, person_crop)
-                            print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
-
-                        # === Điều khiển Servo và bật đèn khi phát hiện người ===
-                        follow_person_and_alert(cx, cy, frame.shape[1], frame.shape[0], frame)
-
-                    distance = point_to_polygon_distance((cx, cy), points)
-                    prev = person_last_pos.get(person_id)
-                    speed = 0
-                    if prev:
-                        dx = abs(cx - prev[0])
-                        dy = abs(cy - prev[1])
-                        speed = (dx + dy) / 2
-                    person_last_pos[person_id] = (cx, cy)
-                    duration = time.time() - tracker.people[person_id]["start_time"]
-
-                    try:
-                        features = [[distance, w, h, speed, duration]]
-                        pred = behavior_model.predict(features)[0]
-                        if pred == 1:
-                            cv2.putText(frame, "AI 🚨 XÂM NHẬP", (x, y + h + 20),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                            print(f"[AI 🚨] Dự đoán: XÂM NHẬP tại ({x}, {y})")
-                            model.alert(frame.copy(), alert_type="INTRUSION_AI")
-                        elif pred == 2:
-                            cv2.putText(frame, "AI 🤨 NGHI NGỜ", (x, y + h + 20),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                            print(f"[AI 🤨] Dự đoán: HÀNH VI NGHI NGỜ tại ({x}, {y})")
-                            model.alert(frame.copy(), alert_type="SUSPICIOUS_AI")
-                    except Exception as e:
-                        print("[AI ERROR]", e)
-
-                    behavior = "?"
-                    if w > 80 and h > 120:
-                        person_img = frame[y:y+h, x:x+w]
-                        if person_img.size > 0:
-                            rgb_person = cv2.cvtColor(person_img, cv2.COLOR_BGR2RGB)
-                            result = pose_detector.process(rgb_person)
-                            if result.pose_landmarks:
-                                try:
-                                    landmarks = result.pose_landmarks.landmark
-                                    a = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-                                    b = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-                                    c = landmarks[mp_pose.PoseLandmark.LEFT_KNEE]
-
-                                    def get_angle(a, b, c):
-                                        ang = math.degrees(math.atan2(c.y - b.y, c.x - b.x) - 
-                                                           math.atan2(a.y - b.y, a.x - b.x))
-                                        return abs(ang if ang <= 180 else 360 - ang)
-
-                                    angle = get_angle(a, b, c)
-                                    if angle > 140:
-                                        behavior = "ĐỨNG"
-                                    elif angle > 90:
-                                        behavior = "NGỒI"
-                                    else:
-                                        behavior = "NẰM / NGÃ?"
-                                except:
-                                    behavior = "KHÔNG XÁC ĐỊNH"
-
-                    # 🚨 Xác định ngã
-                    if behavior == "NẰM / NGÃ?":
-                        now = time.time()
-                        last = tracker.people[person_id].get("last_alert", 0)
-                        is_laying_orientation = w > h * 1.3
-                        is_low_movement = speed < 2
-
-                        if is_laying_orientation and is_low_movement and now - last > 5:
-                            tracker.people[person_id]["last_alert"] = now
-                            behavior = "TÉ NGÃ"
-                            cv2.putText(frame, "⚠️ XÁC NHẬN NGÃ", (x, y + h + 40),
+                        # Kiểm tra xem người có vào vùng cấm không
+                        if point_in_polygon((cx, cy), points):  # Kiểm tra nếu người vào vùng cấm
+                            follow_person_and_alert(cx, cy, frame.shape[1], frame.shape[0], frame)
+                            cv2.putText(frame, "🚨 XÂM NHẬP!", (x, y - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                            print(f"[✅] Phát hiện NGÃ tại ({x}, {y})")
-                            model.alert(frame.copy(), alert_type="FALL_CONFIRMED")
-                        else:
-                            cv2.putText(frame, "⚠️ NGHI TÉ NGÃ", (x, y + h + 40),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                            print(f"[❗] Người có dấu hiệu ngã (chưa xác nhận) tại ({x}, {y})")
+                            print(f"[🚨] Phát hiện xâm nhập tại ({x}, {y})")
+                            model.alert(frame.copy(), alert_type="INTRUSION")
 
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
-                    cv2.putText(frame, f"{behavior}", (x, y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                (0, 255, 255) if behavior == "TÉ NGÃ" else (255, 255, 0), 2)
+                            # === CHỤP ẢNH NGƯỜI XÂM NHẬP ===
+                            save_dir = "/var/www/html/uploads"
+                            os.makedirs(save_dir, exist_ok=True)
 
-                warnings = tracker.get_standing_too_long(timeout=10)
-                for pid, duration, bbox in warnings:
-                    x, y, w, h = bbox
-                    cv2.putText(frame, f"⏱ {duration:.1f}s", (x, y + h + 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    print(f"[⚠️] Người ID {pid} đứng quá lâu ({duration:.1f}s) tại {bbox}")
+                            now = datetime.now()
+                            timestamp = now.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+
+                            filename = os.path.join(save_dir, f"alert_INTRUSION_{timestamp}.jpg")
+
+                            # Cắt phần người xâm nhập ra khỏi khung hình
+                            person_crop = frame[y:y+h, x:x+w]
+                            if person_crop.size > 0:
+                                cv2.imwrite(filename, person_crop)
+                                print(f"[🕒] Giờ lưu ảnh: {now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+                                print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
+
+                            person_crop = frame[y:y+h, x:x+w]
+                            if person_crop.size > 0:
+                                cv2.imwrite(filename, person_crop)
+                                print(f"[💾] Ảnh xâm nhập đã lưu: {filename}")
+
+                            # === Điều khiển Servo và bật đèn khi phát hiện người ===
+                            follow_person_and_alert(cx, cy, frame.shape[1], frame.shape[0], frame)
+
+                        distance = point_to_polygon_distance((cx, cy), points)
+                        prev = person_last_pos.get(person_id)
+                        speed = 0
+                        if prev:
+                            dx = abs(cx - prev[0])
+                            dy = abs(cy - prev[1])
+                            speed = (dx + dy) / 2
+                        person_last_pos[person_id] = (cx, cy)
+                        duration = time.time() - tracker.people[person_id]["start_time"]
+
+                        try:
+                            features = [[distance, w, h, speed, duration]]
+                            pred = behavior_model.predict(features)[0]
+                            if pred == 1:
+                                cv2.putText(frame, "AI 🚨 XÂM NHẬP", (x, y + h + 20),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                print(f"[AI 🚨] Dự đoán: XÂM NHẬP tại ({x}, {y})")
+                                model.alert(frame.copy(), alert_type="INTRUSION_AI")
+                            elif pred == 2:
+                                cv2.putText(frame, "AI 🤨 NGHI NGỜ", (x, y + h + 20),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                                print(f"[AI 🤨] Dự đoán: HÀNH VI NGHI NGỜ tại ({x}, {y})")
+                                model.alert(frame.copy(), alert_type="SUSPICIOUS_AI")
+                        except Exception as e:
+                            print("[AI ERROR]", e)
+
+                        behavior = "?"
+                        if w > 80 and h > 120:
+                            person_img = frame[y:y+h, x:x+w]
+                            if person_img.size > 0:
+                                rgb_person = cv2.cvtColor(person_img, cv2.COLOR_BGR2RGB)
+                                result = pose_detector.process(rgb_person)
+                                if result.pose_landmarks:
+                                    try:
+                                        landmarks = result.pose_landmarks.landmark
+                                        a = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+                                        b = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+                                        c = landmarks[mp_pose.PoseLandmark.LEFT_KNEE]
+
+                                        def get_angle(a, b, c):
+                                            ang = math.degrees(math.atan2(c.y - b.y, c.x - b.x) - 
+                                                            math.atan2(a.y - b.y, a.x - b.x))
+                                            return abs(ang if ang <= 180 else 360 - ang)
+
+                                        angle = get_angle(a, b, c)
+                                        if angle > 140:
+                                            behavior = "ĐỨNG"
+                                        elif angle > 90:
+                                            behavior = "NGỒI"
+                                        else:
+                                            behavior = "NẰM / NGÃ?"
+                                    except:
+                                        behavior = "KHÔNG XÁC ĐỊNH"
+
+                        # 🚨 Xác định ngã
+                        if behavior == "NẰM / NGÃ?":
+                            now = time.time()
+                            last = tracker.people[person_id].get("last_alert", 0)
+                            is_laying_orientation = w > h * 1.3
+                            is_low_movement = speed < 2
+
+                            if is_laying_orientation and is_low_movement and now - last > 5:
+                                tracker.people[person_id]["last_alert"] = now
+                                behavior = "TÉ NGÃ"
+                                cv2.putText(frame, "⚠️ XÁC NHẬN NGÃ", (x, y + h + 40),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                print(f"[✅] Phát hiện NGÃ tại ({x}, {y})")
+                                model.alert(frame.copy(), alert_type="FALL_CONFIRMED")
+                            else:
+                                cv2.putText(frame, "⚠️ NGHI TÉ NGÃ", (x, y + h + 40),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                print(f"[❗] Người có dấu hiệu ngã (chưa xác nhận) tại ({x}, {y})")
+
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+                        cv2.putText(frame, f"{behavior}", (x, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (0, 255, 255) if behavior == "TÉ NGÃ" else (255, 255, 0), 2)
+
+                    warnings = tracker.get_standing_too_long(timeout=10)
+                    for pid, duration, bbox in warnings:
+                        x, y, w, h = bbox
+                        cv2.putText(frame, f"⏱ {duration:.1f}s", (x, y + h + 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        print(f"[⚠️] Người ID {pid} đứng quá lâu ({duration:.1f}s) tại {bbox}")
 
             fps_counter += 1
             if time.time() - fps_timer >= 1.0:
@@ -980,7 +1279,15 @@ if __name__ == '__main__':
         servo_queue.put((move_both_servos, (current_angle_1, current_angle_2)))
 
         return {"status": "success", "message": f"Servo moved: {cmd}", "angle1": current_angle_1, "angle2": current_angle_2}
+    
+    
+    # Khởi tạo và chạy luồng RFID
+    rfid_thread = threading.Thread(target=run_rfid_thread)
+    rfid_thread.daemon = True  # Đảm bảo luồng này sẽ kết thúc khi chương trình chính kết thúc
+    rfid_thread.start()
 
+    password_thread = threading.Thread(target=check_pass)
+    password_thread.start()
     # Khởi động luồng xử lý servo queue
     servo_thread = threading.Thread(target=servo_worker, daemon=True)
     servo_thread.start()
