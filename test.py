@@ -1,14 +1,14 @@
-import asyncio
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import pigpio
+import time
 
-BOT_TOKEN = "7251951915:AAFnZmCIxuMGr_MFe83C9PWoMnNB1_j0k8M"
+pi = pigpio.pi()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"Your chat ID is: {chat_id}")
-    print(f"[DEBUG] CHAT ID: {chat_id}")
+servo_pin = 17  # hoặc 18
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.run_polling()
+for angle in range(0, 181, 30):
+    pw = int(500 + (angle / 180.0) * 2000)
+    pi.set_servo_pulsewidth(servo_pin, pw)
+    print(f"Quay {angle}° → {pw}µs")
+    time.sleep(1)
+
+pi.set_servo_pulsewidth(servo_pin, 0)
